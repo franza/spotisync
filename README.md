@@ -169,9 +169,12 @@ spotisync sync 'PLAYLIST_URL_1' 'PLAYLIST_URL_2' --report matches.csv
    looks for one of yours with the exact same name, and if there is none, it
    creates one. The playlist is only created *after* matching, so a failure
    never leaves an empty playlist behind.
-5. **Add** the missing tracks in Spotify order, 50 per request, with TIDAL's
-   `onDuplicates: SKIP` and an idempotency key, so retries never add a track
-   twice.
+5. **Add** the missing tracks at their Spotify position: each one goes in
+   front of the track that follows it on Spotify, so a song re-added at the
+   top of the Spotify playlist also lands at the top on TIDAL. Tracks already
+   in the TIDAL playlist are never moved, so if you reorder songs on Spotify,
+   TIDAL keeps its order. Requests use TIDAL's `onDuplicates: SKIP` and an
+   idempotency key, so retries never add a track twice.
 6. **Remove** tracks that were deleted from the Spotify playlist since the
    last sync. Use `--keep-removed` to skip this step.
 

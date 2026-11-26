@@ -37,7 +37,12 @@ the interactive login prompts in `auth.py`).
 - **Match before writing.** Create the TIDAL playlist only after matching,
   so a failure never leaves an empty playlist.
 - **No duplicates.** A track counts as already present if its TIDAL ID *or
-  its ISRC* is in the playlist. Spotisync never reorders existing items.
+  its ISRC* is in the playlist.
+- **New tracks land at their Spotify position; existing ones never move.**
+  `plan_insertions` puts each new track in front of the nearest following
+  Spotify track that is already on TIDAL (append if none). The user chose
+  this over full order mirroring: don't add automatic reordering without
+  asking.
 - **Only remove what Spotisync added.** `state.py` records, per Spotify
   playlist, which TIDAL tracks Spotisync put there. Removal candidates come
   only from those records (`split_records`, `entries_to_remove`); tracks the
@@ -82,7 +87,12 @@ TIDAL (`openapi.tidal.com/v2`, JSON:API):
 - Pagination uses `links.next`, which is a path relative to `/v2`.
 - Adding items: `POST /playlists/{id}/relationships/items`, at most 50 per
   request, with `meta.onDuplicates: "SKIP"` and an `Idempotency-Key` header
-  that stays the same across retries of that batch.
+  that stays the same across retries of that batch. `meta.positionBefore`
+  (an entry's `meta.itemId`) inserts in front of that entry instead of
+  appending.
+- Every playlist entry has its own `meta.itemId`; the same track can appear
+  in several entries. Removing (`DELETE`, max 50) and moving (`PATCH` with
+  `meta.positionBefore`, max 20) address entries by `itemId`, not track ID.
 - New playlists use `attributes.name` (not `title`); `accessType` is
   `PUBLIC` or `UNLISTED`.
 - TIDAL rate-limits bursts with HTTP 429; `ApiClient` handles it, so don't

@@ -10,7 +10,7 @@ from spotisync import matching
 from spotisync.auth import OAuthConfig, TokenManager, make_pkce_pair
 from spotisync.http import ApiClient, ApiError, parse_retry_after
 from spotisync.spotify import Playlist, Track, parse_playlist_id, parse_track
-from spotisync.sync import entries_to_remove, split_records, sync_playlist
+from spotisync.sync import entries_to_remove, plan_insertions, split_records, sync_playlist
 from spotisync.state import PlaylistState, Record, StateStore
 from spotisync.tidal import (PlaylistItem, TidalClient, TidalTrack, parse_iso_duration,
                              parse_tracks)
@@ -209,6 +209,7 @@ class FakeTidal(TidalClient):
         self.all_hits = all_hits or {}  # single-ISRC lookups: every release
         self.existing = existing  # (playlist_id, [track ids]) or None
         self.created, self.added, self.expanded, self.removed = [], [], [], []
+        self.positions = []
 
     def tracks_by_isrc(self, isrcs):
         return {i: self.isrc_hits[i] for i in isrcs if i in self.isrc_hits}
@@ -242,8 +243,9 @@ class FakeTidal(TidalClient):
         self.created.append(name)
         return "new-pl"
 
-    def add_tracks(self, pid, ids):
+    def add_tracks(self, pid, ids, position_before=None):
         self.added.append((pid, ids))
+        self.positions.append(position_before)
         return len(ids)
 
 
@@ -510,3 +512,39 @@ def test_state_store_round_trip_and_corrupt_file(tmp_path):
     assert store.load(ID) == state
     (tmp_path / f"{ID}.json").write_text("{not json")
     assert store.load(ID) is None
+
+
+# ── insert position ──────────────────────────────────────────────────
+
+def test_plan_insertions_places_new_tracks_before_their_spotify_successor():
+    wanted = ["new0", "a", "new1", "new2", "b", "new3"]
+    present = {"a": "entry-a", "b": "entry-b"}
+    assert plan_insertions(wanted, ["new0", "new1", "new2", "new3"], present) == [
+        ("entry-a", ["new0"]),             # re-added at the top
+        ("entry-b", ["new1", "new2"]),     # one request for a run of new tracks
+        (None, ["new3"]),                  # nothing after it: append
+    ]
+
+
+def test_plan_insertions_on_a_new_playlist_appends_everything():
+    assert plan_insertions(["a", "b"], ["a", "b"], {}) == [(None, ["a", "b"])]
+
+
+def test_sync_inserts_readded_track_at_its_spotify_position(tmp_path):
+    # Emotion Engine case: track 1 deleted, then re-added at the top on Spotify.
+    store = store_with(tmp_path, state_for([2, 3]))
+    tidal = mirror_tidal([1, 2, 3], ["t2", "t3"])
+    sync_playlist(tidal, Playlist(ID, "Mix", "", [song(1), song(2), song(3)], 0), store=store)
+    assert tidal.added == [("pl", ["t1"])]
+    assert tidal.positions == ["entry-0"]   # in front of t2, the first entry
+
+
+def test_add_tracks_sends_position_before_only_when_given():
+    session = FakeSession([response(200, {"data": []}), response(200, {"data": []})])
+    client = TidalClient(None, country_code="US",
+                         api=ApiClient("https://api.test", StaticTokens(), session=session))
+    client.add_tracks("pl", ["1"], position_before="entry-x")
+    client.add_tracks("pl", ["2"])
+    metas = [kw["json"]["meta"] for _, _, kw in session.calls]
+    assert metas == [{"onDuplicates": "SKIP", "positionBefore": "entry-x"},
+                     {"onDuplicates": "SKIP"}]

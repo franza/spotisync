@@ -24,6 +24,7 @@ JSONAPI = "application/vnd.api+json"
 
 LOOKUP_BATCH = 20   # ISRCs / IDs per GET /tracks request
 ADD_BATCH = 50      # API maximum per POST .../relationships/items
+MOVE_BATCH = 20     # API maximum per PATCH .../relationships/items
 SEARCH_CANDIDATES = 10
 TRACK_INCLUDES = "artists,albums"
 
@@ -289,8 +290,15 @@ class TidalClient:
         )
         return str(doc["data"]["id"])
 
-    def add_tracks(self, playlist_id: str, track_ids: list[str]) -> int:
-        """Append tracks in order, skipping any already present. Returns count added."""
+    def add_tracks(self, playlist_id: str, track_ids: list[str],
+                   position_before: str | None = None) -> int:
+        """Add tracks in order, skipping any already present. Returns count added.
+
+        With `position_before` (the item ID of an existing entry) the tracks
+        are inserted in front of that entry; otherwise they are appended.
+        Later batches go in front of the same entry, so they follow the
+        earlier ones and the order is kept.
+        """
         added = 0
         # Give every track its own, strictly increasing "added" time. Without
         # it a whole batch shares one timestamp, and TIDAL apps sorting by
@@ -306,7 +314,8 @@ class TidalClient:
                         {"type": "tracks", "id": tid, "meta": {"addedAt": stamps[start + i]}}
                         for i, tid in enumerate(batch)
                     ],
-                    "meta": {"onDuplicates": "SKIP"},
+                    "meta": {"onDuplicates": "SKIP",
+                             **({"positionBefore": position_before} if position_before else {})},
                 },
                 # Same key on every retry, so a retried batch is never added twice.
                 headers={"Idempotency-Key": str(uuid.uuid4())},
@@ -315,6 +324,21 @@ class TidalClient:
             added += len(data) if isinstance(data, list) else len(batch)
             log.debug("added batch of %d to %s", len(batch), playlist_id)
         return added
+
+    def move_items(self, playlist_id: str, items: list[PlaylistItem],
+                   position_before: str) -> None:
+        """Move existing entries, in the given order, in front of another entry."""
+        for batch in chunks([i for i in items if i.item_id], MOVE_BATCH):
+            self.api.request(
+                "PATCH",
+                f"playlists/{playlist_id}/relationships/items",
+                json={
+                    "data": [{"type": "tracks", "id": i.track_id, "meta": {"itemId": i.item_id}}
+                             for i in batch],
+                    "meta": {"positionBefore": position_before},
+                },
+                headers={"Idempotency-Key": str(uuid.uuid4())},
+            )
 
     def remove_items(self, playlist_id: str, items: list[PlaylistItem]) -> int:
         """Remove specific playlist entries. Returns how many were removed."""

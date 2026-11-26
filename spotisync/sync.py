@@ -124,6 +124,34 @@ def entries_to_remove(removed: list[Record], items: list[PlaylistItem],
     return list(reversed(chosen))
 
 
+def plan_insertions(wanted: list[str], to_add: list[str],
+                    present: dict[str, str | None]) -> list[tuple[str | None, list[str]]]:
+    """Where to insert new tracks so they land where they are on Spotify.
+
+    `wanted` is the Spotify order, `present` maps a wanted track to the item
+    ID of the TIDAL entry that already represents it (or None). Each new
+    track goes in front of the nearest following track that is already in
+    the playlist; with none after it, it is appended (anchor None). Returns
+    (anchor, tracks) groups in Spotify order. Existing entries never move.
+    """
+    adding = set(to_add)
+    anchor_for: dict[str, str | None] = {}
+    next_anchor: str | None = None
+    for tid in reversed(wanted):
+        if tid in adding:
+            anchor_for[tid] = next_anchor
+        elif present.get(tid):
+            next_anchor = present[tid]
+    groups: list[tuple[str | None, list[str]]] = []
+    for tid in to_add:
+        anchor = anchor_for.get(tid)
+        if groups and groups[-1][0] == anchor:
+            groups[-1][1].append(tid)
+        else:
+            groups.append((anchor, [tid]))
+    return groups
+
+
 def sync_playlist(tidal: TidalClient, playlist: Playlist, *, dry_run: bool = False,
                   always_new: bool = False, access_type: str = "UNLISTED",
                   remove: bool = True, store: StateStore | None = None,
@@ -212,7 +240,13 @@ def sync_playlist(tidal: TidalClient, playlist: Playlist, *, dry_run: bool = Fal
         log.info("created TIDAL playlist %s", sync.tidal_playlist_id)
 
     if to_add:
-        sync.added = tidal.add_tracks(sync.tidal_playlist_id, to_add)
+        entry_of: dict[str, str] = {}
+        for item in items:
+            entry_of.setdefault(item.track_id, item.item_id)
+        present = {tid: entry_of.get(tid) or entry_of.get(id_for_isrc.get(isrc_of.get(tid), ""))
+                   for tid in wanted}
+        for anchor, group in plan_insertions(wanted, to_add, present):
+            sync.added += tidal.add_tracks(sync.tidal_playlist_id, group, position_before=anchor)
     if to_remove:
         tidal.remove_items(sync.tidal_playlist_id, to_remove)
 
