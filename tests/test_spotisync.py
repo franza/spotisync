@@ -10,15 +10,17 @@ from spotisync import matching
 from spotisync.auth import OAuthConfig, TokenManager, make_pkce_pair
 from spotisync.http import ApiClient, ApiError, parse_retry_after
 from spotisync.spotify import Playlist, Track, parse_playlist_id, parse_track
-from spotisync.sync import sync_playlist
-from spotisync.tidal import TidalClient, TidalTrack, parse_iso_duration, parse_tracks
+from spotisync.sync import entries_to_remove, split_records, sync_playlist
+from spotisync.state import PlaylistState, Record, StateStore
+from spotisync.tidal import (PlaylistItem, TidalClient, TidalTrack, parse_iso_duration,
+                             parse_tracks)
 
 ID = "3cEYpjA9oz9GiPac4AsH4n"
 
 
 def sp_track(name="Hey Jude", artists=("The Beatles",), isrc="GBAYE0601690", ms=431000,
-             album=None, album_type=None):
-    return Track(name, tuple(artists), isrc, ms, "sp1", album, album_type)
+             album=None, album_type=None, spotify_id="sp1", added_at=None):
+    return Track(name, tuple(artists), isrc, ms, spotify_id, album, album_type, added_at)
 
 
 def td_track(id="1", title="Hey Jude", artists=("The Beatles",), isrc=None, dur=431.0, version=None,
@@ -206,7 +208,7 @@ class FakeTidal(TidalClient):
         self.isrc_hits, self.search_hits = isrc_hits, search_hits
         self.all_hits = all_hits or {}  # single-ISRC lookups: every release
         self.existing = existing  # (playlist_id, [track ids]) or None
-        self.created, self.added, self.expanded = [], [], []
+        self.created, self.added, self.expanded, self.removed = [], [], [], []
 
     def tracks_by_isrc(self, isrcs):
         return {i: self.isrc_hits[i] for i in isrcs if i in self.isrc_hits}
@@ -227,8 +229,14 @@ class FakeTidal(TidalClient):
     def find_playlists(self, name):
         return [{"id": self.existing[0]}] if self.existing else []
 
-    def playlist_track_ids(self, pid):
-        return self.existing[1]
+    def playlist_items(self, pid):
+        if self.existing is None or pid != self.existing[0]:
+            raise ApiError("GET", f"playlists/{pid}", 404, "not found")
+        return [PlaylistItem(tid, f"entry-{n}") for n, tid in enumerate(self.existing[1])]
+
+    def remove_items(self, pid, items):
+        self.removed.append((pid, [i.track_id for i in items]))
+        return len(items)
 
     def create_playlist(self, name, description="", access_type="UNLISTED"):
         self.created.append(name)
@@ -365,3 +373,140 @@ def test_rerun_does_not_add_album_version_when_single_already_there():
                       all_hits={SONG_ISRC: [SINGLE, ALBUM]}, existing=("old-pl", ["single"]))
     result = sync_playlist(tidal, Playlist(ID, "Mix", "", [album_song()], 0))
     assert tidal.added == [] and result.already_present == 1
+
+
+# ── removal sync ─────────────────────────────────────────────────────
+
+def rec(spotify_id, tidal_id, isrc=None, added_at=None):
+    return Record(spotify_id, isrc, added_at, tidal_id, spotify_id)
+
+
+def song(n, isrc=None):
+    """A Spotify track with its own id, ISRC, add time and a TIDAL match."""
+    return sp_track(name=f"Song {n}", artists=("Band",), isrc=isrc or f"ISRC{n:08d}",
+                    spotify_id=f"sp{n}", added_at=f"2026-01-{n:02d}T00:00:00Z")
+
+
+def tid_for(n):
+    return td_track(id=f"t{n}", title=f"Song {n}", artists=("Band",), isrc=f"ISRC{n:08d}")
+
+
+def mirror_tidal(spotify_nums, tidal_ids, extra_hits=()):
+    hits = {f"ISRC{n:08d}": [tid_for(n)] for n in set(spotify_nums) | set(extra_hits)}
+    return FakeTidal(isrc_hits=hits, search_hits={}, existing=("pl", list(tidal_ids)))
+
+
+def state_for(nums, tidal_playlist_id="pl"):
+    return PlaylistState(ID, tidal_playlist_id,
+                         [rec(f"sp{n}", f"t{n}", f"ISRC{n:08d}", f"2026-01-{n:02d}T00:00:00Z")
+                          for n in nums])
+
+
+def store_with(tmp_path, state=None):
+    store = StateStore(tmp_path)
+    if state:
+        store.save(state)
+    return store
+
+
+def test_split_records_keeps_present_and_vanished_entries():
+    pl = Playlist(ID, "Mix", "", [song(1)], 1, unavailable=("2026-01-03T00:00:00Z",))
+    records = state_for([1, 2, 3]).records
+    removed, keep = split_records(records, pl)
+    assert [r.spotify_id for r in removed] == ["sp2"]          # really removed on Spotify
+    assert [r.spotify_id for r in keep] == ["sp1", "sp3"]      # present / info vanished
+
+
+def test_split_records_matches_by_isrc_when_spotify_id_changed():
+    relinked = sp_track(name="Song 1", isrc="ISRC00000001", spotify_id="new-id")
+    removed, _ = split_records(state_for([1]).records, Playlist(ID, "Mix", "", [relinked], 0))
+    assert removed == []
+
+
+def test_entries_to_remove_leaves_hand_added_duplicate_and_still_wanted():
+    items = [PlaylistItem("t1", "a"), PlaylistItem("t2", "b"), PlaylistItem("t2", "c")]
+    gone = [rec("sp1", "t1"), rec("sp2", "t2")]
+    chosen = entries_to_remove(gone, items, wanted={"t1"})
+    assert chosen == [PlaylistItem("t2", "c")]   # one copy of t2 only; t1 still wanted
+
+
+def test_sync_removes_tracks_deleted_on_spotify(tmp_path):
+    store = store_with(tmp_path, state_for([1, 2, 3]))
+    tidal = mirror_tidal([1, 3], ["t1", "t2", "t3"])
+    result = sync_playlist(tidal, Playlist(ID, "Mix", "", [song(1), song(3)], 0), store=store)
+    assert tidal.removed == [("pl", ["t2"])]
+    assert [r.name for r in result.removed] == ["sp2"]
+    assert {r.spotify_id for r in store.load(ID).records} == {"sp1", "sp3"}
+
+
+def test_sync_never_removes_hand_added_tidal_tracks(tmp_path):
+    store = store_with(tmp_path, state_for([1]))
+    tidal = mirror_tidal([1], ["t1", "manual"])
+    sync_playlist(tidal, Playlist(ID, "Mix", "", [song(1)], 0), store=store)
+    assert tidal.removed == []
+
+
+def test_sync_keeps_track_whose_spotify_info_vanished(tmp_path):
+    store = store_with(tmp_path, state_for([1, 2]))
+    tidal = mirror_tidal([1], ["t1", "t2"])
+    pl = Playlist(ID, "Mix", "", [song(1)], 1, unavailable=("2026-01-02T00:00:00Z",))
+    sync_playlist(tidal, pl, store=store)
+    assert tidal.removed == []
+    # Still recorded, so it is removed later if the entry is really deleted.
+    assert {r.spotify_id for r in store.load(ID).records} == {"sp1", "sp2"}
+    sync_playlist(tidal, Playlist(ID, "Mix", "", [song(1)], 0), store=store)
+    assert tidal.removed == [("pl", ["t2"])]
+
+
+def test_first_sync_with_state_support_removes_nothing_and_records(tmp_path):
+    store = store_with(tmp_path)
+    tidal = mirror_tidal([1], ["t1", "t9"])
+    result = sync_playlist(tidal, Playlist(ID, "Mix", "", [song(1)], 0), store=store)
+    assert tidal.removed == [] and any("First sync" in w for w in result.warnings)
+    assert [r.tidal_id for r in store.load(ID).records] == ["t1"]
+
+
+def test_empty_spotify_response_removes_nothing(tmp_path):
+    store = store_with(tmp_path, state_for([1, 2]))
+    tidal = mirror_tidal([], ["t1", "t2"])
+    result = sync_playlist(tidal, Playlist(ID, "Mix", "", [], 0), store=store)
+    assert tidal.removed == [] and any("empty" in w for w in result.warnings)
+    assert len(store.load(ID).records) == 2
+
+
+def test_keep_removed_option_and_dry_run(tmp_path):
+    store = store_with(tmp_path, state_for([1, 2]))
+    tidal = mirror_tidal([1], ["t1", "t2"])
+    pl = Playlist(ID, "Mix", "", [song(1)], 0)
+    dry = sync_playlist(tidal, pl, store=store, dry_run=True)
+    assert [r.name for r in dry.removed] == ["sp2"] and tidal.removed == []
+    assert len(store.load(ID).records) == 2          # dry run saves nothing
+    sync_playlist(tidal, pl, store=store, remove=False)
+    assert tidal.removed == []
+    assert len(store.load(ID).records) == 2          # still ours for later
+
+
+def test_state_follows_the_recorded_playlist_after_rename(tmp_path):
+    store = store_with(tmp_path, state_for([1, 2]))
+    tidal = mirror_tidal([1], ["t1", "t2"])
+    # Renamed on Spotify: no TIDAL playlist has the new name, the state finds it.
+    sync_playlist(tidal, Playlist(ID, "Renamed", "", [song(1)], 0), store=store)
+    assert tidal.created == [] and tidal.removed == [("pl", ["t2"])]
+
+
+def test_album_version_already_there_is_recorded_as_ours(tmp_path):
+    store = store_with(tmp_path)
+    tidal = FakeTidal(isrc_hits={SONG_ISRC: [SINGLE]}, search_hits={},
+                      all_hits={SONG_ISRC: [SINGLE, ALBUM]}, existing=("pl", ["single"]))
+    tidal.find_playlists = lambda name: [{"id": "pl"}]
+    sync_playlist(tidal, Playlist(ID, "Mix", "", [album_song()], 0), store=store)
+    assert [r.tidal_id for r in store.load(ID).records] == ["single"]
+
+
+def test_state_store_round_trip_and_corrupt_file(tmp_path):
+    store = StateStore(tmp_path)
+    state = PlaylistState(ID, "pl", [Record("sp1", "X", None, "t1", "Song", ("A", "B"))])
+    store.save(state)
+    assert store.load(ID) == state
+    (tmp_path / f"{ID}.json").write_text("{not json")
+    assert store.load(ID) is None

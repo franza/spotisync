@@ -1,9 +1,12 @@
 # Spotisync
 
-Copy Spotify playlists to TIDAL. Tracks are matched by **ISRC** (the
-recording's international ID) and, when that fails, by a search that checks
-title, artist and duration. Running it again on the same playlist only adds
-tracks that are missing. It never creates duplicates.
+Keep TIDAL playlists in sync with Spotify playlists. Tracks are matched by
+**ISRC** (the recording's international ID) and, when that fails, by a search
+that checks title, artist and duration.
+
+Spotify is the source: each sync adds tracks that are new on Spotify and
+removes tracks that were deleted there. Tracks you added to the TIDAL playlist
+yourself are never removed, and it never creates duplicates.
 
 ```
 $ spotisync sync https://open.spotify.com/playlist/3cEYpjA9oz9GiPac4AsH4n
@@ -97,7 +100,7 @@ variables work too and take precedence. Optional settings:
 | `TIDAL_REDIRECT_URI` | `http://localhost:8889/callback` | Must match the TIDAL dashboard exactly |
 | `TIDAL_COUNTRY_CODE` | your TIDAL account's country | Catalog region used for matching |
 | `TIDAL_SCOPES` | `user.read playlists.read playlists.write search.read` | Space-separated |
-| `SPOTISYNC_CONFIG_DIR` | `~/.config/spotisync` | Where login tokens are saved |
+| `SPOTISYNC_CONFIG_DIR` | `~/.config/spotisync` | Where login tokens and sync records are saved |
 
 ## 6. Log in
 
@@ -134,6 +137,7 @@ spotisync sync 'PLAYLIST_URL_1' 'PLAYLIST_URL_2' --report matches.csv
 |---|---|
 | `-n`, `--dry-run` | Match and report, but don't create or change anything on TIDAL |
 | `--new` | Always create a new TIDAL playlist, even if one with the same name exists |
+| `--keep-removed` | Only add tracks; keep tracks that were deleted on Spotify |
 | `--public` | Make newly created playlists public (default: unlisted) |
 | `--report FILE.csv` | Write every track, its TIDAL ID and the match method to a CSV file |
 | `-q`, `--quiet` | Hide the per-track lines |
@@ -160,21 +164,43 @@ spotisync sync 'PLAYLIST_URL_1' 'PLAYLIST_URL_2' --report matches.csv
    - the duration is within 7 seconds.
 
    Otherwise the track is reported as missing rather than guessed.
-4. **Find or create** the TIDAL playlist. Spotisync looks for one of yours
-   with the exact same name. If there is none, it creates one. The playlist is
-   only created *after* matching, so a failure never leaves an empty playlist
-   behind.
+4. **Find or create** the TIDAL playlist. Spotisync uses the playlist it
+   synced to last time, even if you renamed the Spotify playlist. Otherwise it
+   looks for one of yours with the exact same name, and if there is none, it
+   creates one. The playlist is only created *after* matching, so a failure
+   never leaves an empty playlist behind.
 5. **Add** the missing tracks in Spotify order, 50 per request, with TIDAL's
    `onDuplicates: SKIP` and an idempotency key, so retries never add a track
    twice.
+6. **Remove** tracks that were deleted from the Spotify playlist since the
+   last sync. Use `--keep-removed` to skip this step.
+
+### What gets removed
+
+Spotisync remembers which TIDAL tracks it put into each playlist, in
+`~/.config/spotisync/state/` (one small file per Spotify playlist). Only
+those can ever be removed:
+
+- **Deleted on Spotify:** removed from TIDAL on the next sync.
+- **Added by hand on TIDAL:** never removed, because Spotisync didn't add it.
+- **Still listed on Spotify, but without track details** (the song was taken
+  down or isn't available in your region): kept, because you didn't delete it.
+  It is removed once you delete the entry on Spotify.
+- **Spotify returns an empty playlist:** nothing is removed, in case it's an
+  API glitch.
+
+The first sync of a playlist with this version only records what is already
+there and removes nothing. Removals start with the next sync. Run with
+`--dry-run` first to see exactly what would be removed.
 
 HTTP 429 and 5xx responses are retried with backoff (honouring
 `Retry-After`), and expired tokens are refreshed automatically.
 
 ### Limitations
 
-- **Additive only.** Tracks you remove from the Spotify playlist are not
-  removed from TIDAL.
+- The record of what Spotisync added is stored on the computer that ran the
+  sync. Syncing the same playlist from a second computer adds tracks
+  normally, but only removes tracks once that computer has synced it once.
 - Only playlists you own or collaborate on can be read (Spotify's rule, see
   above).
 - Some recordings simply aren't on TIDAL in your region. Those are listed

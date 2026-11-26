@@ -37,6 +37,7 @@ class Track:
     spotify_id: str | None
     album: str | None = None
     album_type: str | None = None   # "ALBUM", "SINGLE" or "COMPILATION"
+    added_at: str | None = None     # when it was added to the playlist (ISO 8601)
 
     @property
     def label(self) -> str:
@@ -50,6 +51,9 @@ class Playlist:
     description: str
     tracks: list[Track]
     skipped: int  # local files, episodes and unavailable entries
+    # `added_at` of entries that are still in the playlist but whose track
+    # details Spotify no longer returns (taken down, region-blocked, ...).
+    unavailable: tuple[str | None, ...] = ()
 
 
 def parse_playlist_id(value: str) -> str:
@@ -63,15 +67,36 @@ def parse_playlist_id(value: str) -> str:
     raise ValueError(f"not a Spotify playlist ID, URL or URI: {value!r}")
 
 
-def parse_track(entry: dict) -> Track | None:
-    """Turn one playlist entry into a Track, or None if it can't be synced."""
-    if entry.get("is_local"):
-        return None
+def _entry_object(entry: dict) -> dict | None:
     # Feb 2026: the object moved to "item"; "track" is deprecated and may be a boolean.
     obj = entry.get("item")
     if not isinstance(obj, dict):
         obj = entry.get("track")
-    if not isinstance(obj, dict) or obj.get("type", "track") != "track":
+    return obj if isinstance(obj, dict) else None
+
+
+def is_unavailable(entry: dict) -> bool:
+    """An entry that is still in the playlist but whose track info is gone.
+
+    Local files and podcast episodes are not "unavailable"; they are simply
+    never synced.
+    """
+    if entry.get("is_local"):
+        return False
+    obj = _entry_object(entry)
+    if obj is None:
+        return True
+    if obj.get("is_local") or obj.get("type", "track") != "track":
+        return False
+    return not obj.get("name")
+
+
+def parse_track(entry: dict) -> Track | None:
+    """Turn one playlist entry into a Track, or None if it can't be synced."""
+    if entry.get("is_local"):
+        return None
+    obj = _entry_object(entry)
+    if obj is None or obj.get("type", "track") != "track":
         return None
     if obj.get("is_local") or not obj.get("name"):
         return None
@@ -85,6 +110,7 @@ def parse_track(entry: dict) -> Track | None:
         spotify_id=obj.get("id"),
         album=album.get("name") or None,
         album_type=(album.get("album_type") or "").upper() or None,
+        added_at=entry.get("added_at") or None,
     )
 
 
@@ -115,6 +141,7 @@ class SpotifyClient:
             meta = self.api.get(f"playlists/{playlist_id}",
                                 params={"fields": "id,name,description"})
             tracks: list[Track] = []
+            unavailable: list[str | None] = []
             skipped = 0
             for page in self._pages(f"playlists/{playlist_id}/items",
                                     {"limit": PAGE_SIZE, "additional_types": "track"}):
@@ -122,6 +149,8 @@ class SpotifyClient:
                     track = parse_track(entry)
                     if track is None:
                         skipped += 1
+                        if is_unavailable(entry):
+                            unavailable.append(entry.get("added_at") or None)
                     else:
                         tracks.append(track)
         except ApiError as exc:
@@ -141,4 +170,5 @@ class SpotifyClient:
             description=meta.get("description") or "",
             tracks=tracks,
             skipped=skipped,
+            unavailable=tuple(unavailable),
         )

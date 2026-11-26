@@ -24,7 +24,8 @@ don't add an SDK (spotipy, tidalapi, …) without a strong reason.
 | `spotisync/spotify.py` | Read a Spotify playlist into `Track`s |
 | `spotisync/tidal.py` | TIDAL catalog lookups, search, playlist reads and writes; `TidalTrack` |
 | `spotisync/matching.py` | Pure functions: normalisation, scoring, choosing a TIDAL release |
-| `spotisync/sync.py` | Orchestration: match all tracks, then find or create the playlist, then add missing tracks |
+| `spotisync/state.py` | Per-playlist record of which TIDAL tracks Spotisync added (`~/.config/spotisync/state/`) |
+| `spotisync/sync.py` | Orchestration: match all tracks, find or create the playlist, add missing tracks, remove ones deleted on Spotify |
 | `spotisync/cli.py` | argparse CLI and `Settings.from_env()` (env vars and `.env`) |
 
 Keep this split: API clients don't decide matches, `matching.py` makes no
@@ -35,9 +36,19 @@ the interactive login prompts in `auth.py`).
 
 - **Match before writing.** Create the TIDAL playlist only after matching,
   so a failure never leaves an empty playlist.
-- **Re-runs are additive and duplicate-free.** A track counts as already
-  present if its TIDAL ID *or its ISRC* is in the playlist. Spotisync never
-  removes or reorders existing items.
+- **No duplicates.** A track counts as already present if its TIDAL ID *or
+  its ISRC* is in the playlist. Spotisync never reorders existing items.
+- **Only remove what Spotisync added.** `state.py` records, per Spotify
+  playlist, which TIDAL tracks Spotisync put there. Removal candidates come
+  only from those records (`split_records`, `entries_to_remove`); tracks the
+  user added on TIDAL by hand must never be removed. Specifically:
+  - a record is removed only when neither its Spotify ID nor its ISRC is in
+    the Spotify playlist any more;
+  - entries Spotify still lists without track details (`Playlist.unavailable`)
+    protect records with the same `added_at`;
+  - an empty Spotify response removes nothing;
+  - no state means no removals (the first sync only records);
+  - a dry run writes nothing, not even state.
 - **Order follows Spotify.** Every added item gets its own increasing
   `meta.addedAt` (`added_at_stamps`). Without that, a whole batch shares one
   timestamp and TIDAL apps sorting by date added show it in arbitrary order.

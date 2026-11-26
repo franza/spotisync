@@ -48,6 +48,14 @@ class TidalTrack:
         return f"{self.title} ({self.version})" if self.version else self.title
 
 
+@dataclass(frozen=True)
+class PlaylistItem:
+    """One entry of a TIDAL playlist. `item_id` identifies the entry itself
+    (needed to remove it); the same track can appear in several entries."""
+    track_id: str
+    item_id: str
+
+
 def parse_iso_duration(value: str | None) -> float | None:
     """Parse an ISO 8601 duration such as 'PT3M20S' into seconds."""
     if not value:
@@ -255,12 +263,18 @@ class TidalClient:
                     matches.append(res)
         return matches
 
-    def playlist_track_ids(self, playlist_id: str) -> list[str]:
-        ids: list[str] = []
+    def playlist_items(self, playlist_id: str) -> list[PlaylistItem]:
+        """The playlist's track entries in playlist order."""
+        items: list[PlaylistItem] = []
         params = {"countryCode": self.country_code}
         for doc in self._paginate(f"playlists/{playlist_id}/relationships/items", params):
-            ids.extend(str(r["id"]) for r in doc.get("data") or [] if r.get("type") == "tracks")
-        return ids
+            for r in doc.get("data") or []:
+                if r.get("type") == "tracks":
+                    items.append(PlaylistItem(str(r["id"]), str((r.get("meta") or {}).get("itemId") or "")))
+        return items
+
+    def playlist_track_ids(self, playlist_id: str) -> list[str]:
+        return [item.track_id for item in self.playlist_items(playlist_id)]
 
     def create_playlist(self, name: str, description: str = "",
                         access_type: str = "UNLISTED") -> str:
@@ -301,3 +315,19 @@ class TidalClient:
             added += len(data) if isinstance(data, list) else len(batch)
             log.debug("added batch of %d to %s", len(batch), playlist_id)
         return added
+
+    def remove_items(self, playlist_id: str, items: list[PlaylistItem]) -> int:
+        """Remove specific playlist entries. Returns how many were removed."""
+        removable = [i for i in items if i.item_id]
+        for batch in chunks(removable, ADD_BATCH):
+            self.api.request(
+                "DELETE",
+                f"playlists/{playlist_id}/relationships/items",
+                json={"data": [
+                    {"type": "tracks", "id": i.track_id, "meta": {"itemId": i.item_id}}
+                    for i in batch
+                ]},
+                headers={"Idempotency-Key": str(uuid.uuid4())},
+            )
+            log.debug("removed batch of %d from %s", len(batch), playlist_id)
+        return len(removable)
